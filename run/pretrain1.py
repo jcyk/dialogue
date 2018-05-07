@@ -27,17 +27,24 @@ if __name__ == "__main__":
     optim.set_parameters(model.D.named_parameters())
 
     tgt_vocab = Vocab(opt.tgt_vocab)
-    train_set = Data_Loader(opt.train_file, 2)#opt.batch_size)
-    valid_set = Data_Loader(opt.dev_file, opt.batch_size, sort = False)
-    model.eval()
+    train_set = Data_Loader(opt.train_file, opt.batch_size)
+    valid_set = Data_Loader(opt.dev_file, opt.batch_size)
     for epoch in xrange(opt.max_epoch):
+        model.train()
         for batch in train_set:
             src, src_len = batch.src
             tgt, tgt_len = batch.tgt
             model.zero_grad()
-            loss, _  = model(src, tgt, src_len, tgt_len, mode="D")
+            loss, _, acc  = model(src, tgt, src_len, tgt_len, mode="D")
             loss = loss.mean()
-            print loss.data[0]
             loss.backward()
             optim.step()
+        model.eval()
+        tot_acc = 0
+        for batch in valid_set:
+            src, src_len = batch.src
+            tgt, tgt_len = batch.tgt
+            _, _, acc  = model(src, tgt, src_len, tgt_len, mode="D")
+            tot_acc += acc
+        print epoch, tot_acc / len(valid_set)
         model.save_checkpoint(epoch, opt, 'D')

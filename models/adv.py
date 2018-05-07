@@ -12,7 +12,7 @@ from lib import data
 import os
 from torch.autograd import Variable
 from models import CNNEncoder, continuousEmbedding
-
+import math
 
 class Discriminator(nn.Module):
     def __init__(self, q_encoder, r_encoder):
@@ -51,7 +51,7 @@ class ADVModel(nn.Module):
         dec_state = self.G.decoder.init_decoder_state(q, memory_bank, enc_final)
         inp = r_prefix
 
-        batch_size = q.size()[1]
+        batch_size = q.size(1)
         notyet = torch.ByteTensor(batch_size).fill_(1)
         notyet = notyet.cuda()
         log_prob = 0.
@@ -66,34 +66,32 @@ class ADVModel(nn.Module):
                 cur_log_prob = self.G.generator(output + noise)
                 _, next_token = torch.max(cur_log_prob, -1)
                 inp = torch.exp(cur_log_prob + eps)
-                inp.data.masked_fill_( (1-notyet).view(-1,1), 0.)
-                result.append(inp) #batch_size x vocab_size
-                inp = inp.unsqueeze(0)
+                inp.data.masked_fill_( (1-notyet).view(-1,1), 0.) #batch_size x vocab_size
             if mode == "gumbel":
-                gumbel_output = output - torch.log(- torch.log(torch.zeros_like(output).uniform_(0, 1) + eps) +eps)
+                seed = torch.zeros_like(output)
+                seed.data.uniform_(0, 1)
+                gumbel_output = output - torch.log(- torch.log(seed + eps) +eps)
                 gumbel_output = gumbel_output / temperature
                 cur_log_prob = self.G.generator(gumbel_output)
                 _, next_token = torch.max(cur_log_prob, -1)
                 inp = torch.exp(cur_log_prob + eps)
-                inp.data.masked_fill_( (1- notyet).view(-1, 1), 0.)
-                result.append(inp) #batch_size x vocab_size
-                inp = inp.unsqueeze(0)
+                inp.data.masked_fill_( (1- notyet).view(-1, 1), 0.)  #batch_size x vocab_size
             if mode == "reinforce":
                 cur_log_prob = self.G.generator(output)
                 _, next_token = torch.max(cur_log_prob, -1)
-                samples = torch.multinomial(torch.exp(cur_log_prob), 1).unsqueeze(-1)
-                cur_log_prob = torch.gather(cur_log_prob, -1, samples)
+                inp = torch.multinomial(torch.exp(cur_log_prob + eps), 1).squeeze(-1)
+                cur_log_prob = torch.gather(cur_log_prob, -1, inp.view(-1, 1)).squeeze(-1)
                 cur_log_prob.data.masked_fill_(1-notyet, 0.)
                 log_prob = log_prob + cur_log_prob
-                inp = samples.data.masked_fill_( 1-notyet, 0)
-                result.append(samples) # batch_size
-                inp = inp.unsqueeze(0)
+                inp.data.masked_fill_( 1-notyet, 0) # batch_size
+            inp = inp.unsqueeze(0)
+            result.append(inp)
             endding = torch.eq(next_token, data.EOT_idx)
             notyet.masked_fill_(endding.data, 0)
-        result = torch.stack(result)
+        result = torch.cat(result, 0)
         return result, log_prob
-        # len x batch_size x vocab_size or len x batch_size
-        # batch_size
+        # result: len x batch_size x vocab_size or len x batch_size
+        # log_prob: batch_size
 
     def forward(self, q, r, q_lens, r_lens =None, mode = None):
         if mode == "D":
@@ -114,7 +112,8 @@ class ADVModel(nn.Module):
         # batch x nq x nr
 
         score_matrix = self.D([q],[pred, r[1:]])
-        return self._compute_D_loss(score_matrix, q_index, r_index), log_prob
+        loss, acc = self._compute_D_loss(score_matrix, q_index, r_index)
+        return loss, log_prob, acc
 
     def _compute_D_loss(self, score_matrix, q_index, r_index):
         if r_index is not None:
@@ -122,15 +121,17 @@ class ADVModel(nn.Module):
             tgt = torch.LongTensor(batch_size * nq).fill_(r_index)
             tgt = Variable(tgt).cuda()
             score_matrix = score_matrix.view(-1, nr)
-            print score_matrix
-            return (F.cross_entropy(score_matrix, tgt, reduce=False)).view(batch_size)
+            _, label  = torch.max(score_matrix, -1)
+            acc = torch.eq(label, tgt).float().mean().data[0]
+            return (F.cross_entropy(score_matrix, tgt, reduce=False)).view(batch_size), acc
 
     def G_func(self, q, r, q_lens, r_lens):
         if self.backprob_mode == "approx" or self.backprob_mode == "gumbel":
-            reward, log_prob = self.D_func(q, r, q_lens, r_lens, r_index = 0)
+            reward, log_prob, acc = self.D_func(q, r, q_lens, r_lens, r_index = 0)
             return reward
         if self.backprob_mode == "reinforce":
-            reward, log_prob= self.D_func(q, r, q_lens, r_lens, r_index = 0)
+            reward, log_prob, acc= self.D_func(q, r, q_lens, r_lens, r_index = 0)
+            reward.detach_()
             return reward  * log_prob
 
     def save_checkpoint(self, epoch, model_opt, suffix=""):
@@ -207,7 +208,7 @@ def make_G_model(model_opt, use_cuda = True, checkpoint=None):
             for p in generator.parameters():
                 if p.dim() > 1:
                     xavier_uniform(p)
-                    
+
     model.generator = generator
     # Make the whole model leverage GPU if indicated to do so.
     if use_cuda:
