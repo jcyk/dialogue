@@ -45,7 +45,7 @@ class ADVModel(nn.Module):
         self.backprob_mode = model_opt.backprob_mode
         self.model_opt = model_opt
 
-    def sample(self, q, r_prefix, q_lens, temperature = 1., max_len = 50, eps = 1e-20):
+    def sample(self, q, r_prefix, q_lens, temperature = 0.1, max_len = 50, eps = 1e-20):
         mode = self.backprob_mode
         enc_final, memory_bank = self.G.encoder(q, q_lens)
         dec_state = self.G.decoder.init_decoder_state(q, memory_bank, enc_final)
@@ -63,16 +63,17 @@ class ADVModel(nn.Module):
             if mode == "approx":
                 noise = torch.zeros_like(output)
                 noise.data.normal_(0, 0.01)
-                cur_log_prob = self.G.generator(output + noise)
+                approx_output = (output + noise) / temperature
+                cur_log_prob = self.G.generator(approx_output)
                 _, next_token = torch.max(cur_log_prob, -1)
                 inp = torch.exp(cur_log_prob + eps)
                 inp.data.masked_fill_( (1-notyet).view(-1,1), 0.) #batch_size x vocab_size
             if mode == "gumbel":
-                seed = torch.zeros_like(output)
+                logits = self.G.generator[0](output)
+                seed = torch.zeros_like(logits)
                 seed.data.uniform_(0, 1)
-                gumbel_output = output - torch.log(- torch.log(seed + eps) +eps)
-                gumbel_output = gumbel_output / temperature
-                cur_log_prob = self.G.generator(gumbel_output)
+                gumbel_logits = (logits - torch.log(- torch.log(seed + eps) +eps))/ temperature
+                cur_log_prob = self.G.generator[1](gumbel_logits)
                 _, next_token = torch.max(cur_log_prob, -1)
                 inp = torch.exp(cur_log_prob + eps)
                 inp.data.masked_fill_( (1- notyet).view(-1, 1), 0.)  #batch_size x vocab_size
@@ -80,6 +81,7 @@ class ADVModel(nn.Module):
                 cur_log_prob = self.G.generator(output)
                 _, next_token = torch.max(cur_log_prob, -1)
                 inp = torch.multinomial(torch.exp(cur_log_prob + eps), 1).squeeze(-1)
+                #print 'Good boy', torch.eq(next_token, inp).float().mean().data[0]
                 cur_log_prob = torch.gather(cur_log_prob, -1, inp.view(-1, 1)).squeeze(-1)
                 cur_log_prob.data.masked_fill_(1-notyet, 0.)
                 log_prob = log_prob + cur_log_prob
